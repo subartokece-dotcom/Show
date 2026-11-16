@@ -1,0 +1,111 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Job ID unik dari bot"
+        required: true
+      userId:
+        description: "User ID"
+        required: false
+        default: "0"
+      payload:
+        description: "JSON payload dari bot"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      PAYLOAD: ${{ inputs.payload }}
+
+    steps:
+      - name: Parse payload
+        id: p
+        run: |
+          echo "mode=$(echo "$PAYLOAD" | jq -r '.mode // "zip"')" >> $GITHUB_OUTPUT
+          echo "url=$(echo "$PAYLOAD" | jq -r '.url // ""')" >> $GITHUB_OUTPUT
+          echo "build_type=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')" >> $GITHUB_OUTPUT
+          echo "app_name=$(echo "$PAYLOAD" | jq -r '.appName // "WebApp"')" >> $GITHUB_OUTPUT
+          echo "icon_url=$(echo "$PAYLOAD" | jq -r '.iconUrl // ""')" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # ===== MODE ZIP: download source project dari release =====
+      - name: Download & extract source (mode zip)
+        if: steps.p.outputs.mode == 'zip'
+        run: |
+          mkdir -p work && cd work
+          curl -fL "${{ steps.p.outputs.url }}" -o src.zip
+          unzip -q src.zip -d src
+          # kalau isinya 1 folder pembungkus, masuk ke dalamnya
+          PROJ=$(find src -maxdepth 3 -name pubspec.yaml -printf '%h\n' | head -n1)
+          [ -z "$PROJ" ] && echo "pubspec.yaml tidak ditemukan di ZIP" && exit 1
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/work/$PROJ" >> $GITHUB_ENV
+
+      # ===== MODE URL: bikin app WebView sederhana =====
+      - name: Generate WebView app (mode url)
+        if: steps.p.outputs.mode == 'url'
+        run: |
+          mkdir -p work && cd work
+          flutter create --org com.web2apk --project-name webapp app
+          cd app
+          flutter pub add webview_flutter
+          cat > lib/main.dart <<EOF
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          void main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: Home()));
+          class Home extends StatefulWidget { const Home({super.key}); @override State<Home> createState() => _H(); }
+          class _H extends State<Home> {
+            late final WebViewController c = WebViewController()
+              ..setJavaScriptMode(JavaScriptMode.unrestricted)
+              ..loadRequest(Uri.parse('${{ steps.p.outputs.url }}'));
+            @override Widget build(BuildContext x) => Scaffold(body: SafeArea(child: WebViewWidget(controller: c)));
+          }
+          EOF
+          sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ steps.p.outputs.app_name }}\"|" android/app/src/main/AndroidManifest.xml
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          if [ -n "${{ steps.p.outputs.icon_url }}" ]; then
+            curl -fL "${{ steps.p.outputs.icon_url }}" -o icon.png || true
+            if [ -f icon.png ]; then
+              flutter pub add dev:flutter_launcher_icons
+              printf 'flutter_launcher_icons:\n  android: true\n  ios: false\n  image_path: "icon.png"\n' > flutter_launcher_icons.yaml
+              dart run flutter_launcher_icons || true
+            fi
+          fi
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/work/app" >> $GITHUB_ENV
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          if [ "${{ steps.p.outputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Kumpulkan APK
+        run: |
+          mkdir -p out
+          find "$PROJECT_DIR/build/app/outputs" -name "*.apk" -exec cp {} out/ \;
+          ls -la out
+          [ -n "$(ls out)" ] || (echo "APK tidak ditemukan" && exit 1)
+
+      # Nama artifact WAJIB mengandung "apk" -> bot mencarinya dengan nama ini
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: out/*.apk
+          retention-days: 1
